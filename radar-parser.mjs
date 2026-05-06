@@ -3,16 +3,20 @@ import { getFirestore } from "firebase-admin/firestore";
 import { S3Client, ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";
 import { Level2Radar } from 'nexrad-level-2-data';
 
-// 1. Initialize Firebase using the GitHub Secret
+// --- CABINET AUTHENTICATION ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 const app = initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore(app);
 
-// 2. Configure S3 Client for TRULY Anonymous Access
-// By omitting credentials and setting the signer to a no-op, 
-// we bypass the "InvalidAccessKeyId" error and the "403 Forbidden".
+// --- TACTICAL S3 CONFIGURATION ---
+// We provide dummy credentials to prevent the 'CredentialsProviderError'
+// while the 'signer' middleware ensures we stay anonymous.
 const s3Client = new S3Client({
     region: "us-east-1",
+    credentials: {
+        accessKeyId: "00000000000000000000", 
+        secretAccessKey: "0000000000000000000000000000000000000000"
+    },
     signer: { sign: async (request) => request } 
 });
 
@@ -27,7 +31,6 @@ async function executeTacticalSweep() {
 
         console.log(`[SYSTEM] Accessing NOAA Sector: ${prefix} (UTC)`);
 
-        // 3. Use the SDK to list objects anonymously
         const listCommand = new ListObjectsV2Command({
             Bucket: "noaa-nexrad-level2",
             Prefix: prefix
@@ -40,7 +43,6 @@ async function executeTacticalSweep() {
             return;
         }
 
-        // Filter for valid radar binaries (V06) and sort for the latest
         const validScans = listOutput.Contents
             .filter(item => item.Key.endsWith('V06') && !item.Key.endsWith('_MDM'))
             .sort((a, b) => b.LastModified - a.LastModified);
@@ -53,7 +55,6 @@ async function executeTacticalSweep() {
         const targetScanKey = validScans[0].Key;
         console.log(`[SUCCESS] Intercepted latest 2026 transmission: ${targetScanKey}`);
 
-        // 4. Download directly to RAM using the SDK
         const getCommand = new GetObjectCommand({
             Bucket: "noaa-nexrad-level2",
             Key: targetScanKey
@@ -64,7 +65,6 @@ async function executeTacticalSweep() {
 
         console.log(`[SYSTEM] Memory Load: ${(rawBuffer.length / (1024 * 1024)).toFixed(2)} MB locked in RAM.`);
 
-        // 5. Parse using the local nexrad dependency
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
         let stormPoints = [];
@@ -75,7 +75,6 @@ async function executeTacticalSweep() {
                 const record = radialMsg.record;
                 if (record.reflect && record.reflect.moment_data) {
                     record.reflect.moment_data.forEach((dbz, gateIndex) => {
-                        // Extracting significant atmospheric points
                         if (dbz !== null && dbz >= 18) {
                             stormPoints.push({ a: record.azimuth, g: gateIndex, v: Math.round(dbz) });
                         }
@@ -86,8 +85,6 @@ async function executeTacticalSweep() {
 
         if (stormPoints.length > 0) {
             const tacticalPayload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
-            
-            // Sync with your 5-minute database requirement
             const localNow = new Date();
             const mins = Math.floor(localNow.getMinutes() / 5) * 5;
             const docName = `STORM_${year}-${month}-${day}_${String(localNow.getHours()).padStart(2, '0')}${String(mins).padStart(2, '0')}`;
