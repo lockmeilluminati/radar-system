@@ -1,0 +1,20 @@
+name: Tactical Scan Automation
+
+on:
+  schedule:
+    - cron: '*/5 * * * *' # Every 5 minutes
+  push:
+    branches: [ master ] # Run immediately on every push
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: node radar-parser.mjs
+        env:
+          FIREBASE_KEY: ${{ secrets.FIREBASE_KEY }}

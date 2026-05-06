@@ -1,90 +1,69 @@
-import { initializeApp } from "firebase/app";
-import { getFirestore, doc, setDoc } from "firebase/firestore";
+import { initializeApp, cert } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
 import { Level2Radar } from 'nexrad-level-2-data';
 import fs from 'fs';
 
-// Firebase Config
-const firebaseConfig = {
-    apiKey: "AIzaSyCLpBKVtRzf-uuM4r-w5AFcm-i2XrSiVPk",
-    authDomain: "radar-5e4a5.firebaseapp.com",
-    projectId: "radar-5e4a5",
-    storageBucket: "radar-5e4a5.firebasestorage.app",
-    messagingSenderId: "230281188214",
-    appId: "1:230281188214:web:9a2bcadae56281749b6057"
-};
+// --- TACTICAL SECRETS DECODING ---
+// This allows GitHub Actions to use your key without it being in the code
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
-const app = initializeApp(firebaseConfig);
+const app = initializeApp({
+    credential: cert(serviceAccount)
+});
 const db = getFirestore(app);
 
-async function tacticalUplink() {
+async function executeTacticalSweep() {
     try {
-        console.log("--- INITIATING SECTION 9 UPLINK ---");
+        console.log("--- INITIATING 5-MINUTE AUTO-SWEEP ---");
+        
+        // This binary needs to be in your repository for the first run
         const rawData = fs.readFileSync("./KLSX20260506_051438_V06");
         const radar = await new Level2Radar(rawData);
         const sweeps = radar.data || [];
 
         let stormPoints = [];
-
-        sweeps.forEach((sweep, sIdx) => {
+        sweeps.forEach((sweep) => {
             if (!sweep) return;
-            sweep.forEach((radialMsg, rIdx) => {
+            sweep.forEach((radialMsg) => {
                 const record = radialMsg.record;
                 const az = record.azimuth;
                 const reflect = record.reflect;
-
                 if (reflect && reflect.moment_data) {
-                    const data = reflect.moment_data;
-                    
-                    // Verbose Logging for first 3 radials of Sweep 0
-                    if (sIdx === 0 && rIdx < 3) {
-                        console.log(`\n[RADIAL ${rIdx}] AZIMUTH LOCKED: ${az.toFixed(2)}°`);
-                        console.log(` > GATES: ${reflect.gate_count} | SAMPLES: [${data.slice(0, 5).join(', ')}]`);
-                    }
-
-                    data.forEach((dbz, gateIndex) => {
-                        // Filter: 15dBZ threshold to catch the core
-                        if (dbz !== null && dbz >= 15) {
-                            stormPoints.push({
-                                a: az,
-                                g: gateIndex,
-                                v: Math.round(dbz)
-                            });
+                    reflect.moment_data.forEach((dbz, gateIndex) => {
+                        if (dbz !== null && dbz >= 15) { 
+                            stormPoints.push({ a: az, g: gateIndex, v: Math.round(dbz) });
                         }
                     });
                 }
             });
         });
 
-        console.log(`\n--- TACTICAL ANALYSIS COMPLETE ---`);
-        console.log(`Total Significant Points Found: ${stormPoints.length}`);
-
         if (stormPoints.length > 0) {
-            // Sort by intensity and slice to 1000 to protect the Cabinet
-            const tacticalPayload = stormPoints
-                .sort((a, b) => b.v - a.v)
-                .slice(0, 1000);
+            const tacticalPayload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
 
-            // 1. UPLINK STORM ARRAY
-            await setDoc(doc(db, "radar_live", "STORM_DATA"), {
+            // 5-Minute Precision Logic
+            const now = new Date();
+            const year = now.getFullYear();
+            const month = String(now.getMonth() + 1).padStart(2, '0');
+            const day = String(now.getDate()).padStart(2, '0');
+            const mins = Math.floor(now.getMinutes() / 5) * 5;
+            
+            const archiveDate = `${year}-${month}-${day}`; 
+            const archiveTime = String(now.getHours()).padStart(2, '0') + String(mins).padStart(2, '0');
+            const documentName = `STORM_${archiveDate}_${archiveTime}`;
+
+            await db.collection("radar_archive").doc(documentName).set({
                 points: JSON.stringify(tacticalPayload),
                 count: tacticalPayload.length,
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                sensor: "KLSX"
             });
 
-            // 2. UPLINK SENSOR STATUS
-            await setDoc(doc(db, "radar_live", "KLSX"), {
-                station: "KLSX (St. Louis)",
-                status: "Online",
-                vcp: radar.vcp?.pattern_number || 215,
-                last_updated: new Date().toISOString()
-            });
-
-            console.log("SUCCESS: 1000 Points Uplinked to Cabinet.");
+            console.log(`[SUCCESS] 11:00 Sector Secured: ${documentName}`);
         }
-
     } catch (error) {
-        console.error("UPLINK FAILED:", error.stack);
+        console.error("SWEEP FAILED:", error);
+        process.exit(1);
     }
 }
-
-tacticalUplink();
+executeTacticalSweep();
