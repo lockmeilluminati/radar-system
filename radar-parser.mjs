@@ -9,39 +9,41 @@ const db = getFirestore();
 
 async function executeTacticalSweep() {
     try {
-        console.log("--- INITIATING 2026 IEM ACADEMIC INTERCEPT ---");
+        console.log("--- INITIATING 2026 SYNCHRONIZED INTERCEPT ---");
         
-        // Target the IEM Professional Mirror for St. Louis
-        const iemBaseUrl = "https://mesonet.agron.iastate.edu/data/nexrd2/raw/KLSX/";
-        console.log(`[SYSTEM] Scanning University Gateway: ${iemBaseUrl}`);
+        // Target the NEW 2026 dedicated radar subdomain
+        const iemBaseUrl = "https://mesonet-nexrad.agron.iastate.edu/level2/raw/KLSX/";
+        console.log(`[SYSTEM] Accessing Dedicated High-Speed Mirror: ${iemBaseUrl}`);
 
-        // 1. Fetch the directory listing (HTML)
         const response = await fetch(iemBaseUrl);
-        if (!response.ok) throw new Error(`IEM Mirror Offline: ${response.status}`);
+        if (!response.ok) throw new Error(`Mirror Unavailable: ${response.status}`);
+
         const html = await response.text();
         
-        // 2. Extract the absolute latest 2026 binary using Regex
-        // Format: KLSX_YYYYMMDD_HHMM.gz
+        // Extract the absolute latest 2026 binary (KLSX_YYYYMMDD_HHMM.gz)
+        // Correcting the pattern to ensure it grabs only the live .gz files
         const filePattern = /KLSX_2026\d{4}_\d{4}\.gz/g;
         const matches = [...html.matchAll(filePattern)].map(m => m[0]);
 
         if (matches.length === 0) {
-            console.log("[ALERT] Sector empty on IEM Mirror. Sync in progress.");
+            console.log("[ALERT] Sector empty. Scanning for directory updates...");
+            // Debug: Log the first bit of HTML to see if the directory structure shifted
+            console.log(`[DEBUG] HTML Snippet: ${html.substring(0, 300)}`);
             return;
         }
 
-        // Grab the absolute last file in the list (most recent)
+        // Grab the absolute last file (freshest data)
         const targetFile = matches.sort().pop(); 
         console.log(`[SUCCESS] Intercepted 2026 Transmission: ${targetFile}`);
 
-        // 3. THE RAM UPLINK: Zero-disk binary fetch
+        // THE RAM UPLINK: Zero-disk binary fetch
         const downloadUrl = `${iemBaseUrl}${targetFile}`;
         const fileResponse = await fetch(downloadUrl);
         const rawBuffer = Buffer.from(await fileResponse.arrayBuffer());
 
         console.log(`[SYSTEM] Memory Load: ${(rawBuffer.length / 1024 / 1024).toFixed(2)} MB locked in RAM.`);
 
-        // 4. Parse the radar binary
+        // Parse and process
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
         let stormPoints = [];
@@ -51,7 +53,7 @@ async function executeTacticalSweep() {
                 const dbzData = msg.record?.reflect?.moment_data;
                 if (dbzData) {
                     dbzData.forEach((dbz, i) => {
-                        // Intensity filter for atmospheric data
+                        // Capturing intensity thresholds
                         if (dbz >= 18) {
                             stormPoints.push({ 
                                 a: msg.record.azimuth, 
@@ -65,7 +67,7 @@ async function executeTacticalSweep() {
         });
 
         if (stormPoints.length > 0) {
-            const tacticalPayload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
+            const payload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
             
             // Format for the 5-minute UI timeline
             const now = new Date();
@@ -73,18 +75,16 @@ async function executeTacticalSweep() {
             const docName = `STORM_2026-05-06_${String(now.getHours()).padStart(2, '0')}${String(mins).padStart(2, '0')}`;
 
             await db.collection("radar_archive").doc(docName).set({
-                points: JSON.stringify(tacticalPayload),
-                count: tacticalPayload.length,
+                points: JSON.stringify(payload),
                 timestamp: Date.now(),
                 sensor: "KLSX",
-                source: `IEM://${targetFile}`
+                source: `IEM_NEXRAD://${targetFile}`
             });
 
             console.log(`[LOCKED] 2026 Data Deployed to Cabinet: ${docName}`);
         }
     } catch (error) {
         console.error("MISSION CRITICAL FAILURE:", error.message);
-        process.exit(1);
     }
 }
 
