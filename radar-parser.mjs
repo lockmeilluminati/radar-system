@@ -1,69 +1,70 @@
 import { initializeApp, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
+import { S3Client, ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";
 import { Level2Radar } from 'nexrad-level-2-data';
 
-// --- CABINET AUTHENTICATION ---
+// 1. Initialize Firebase using the GitHub Secret
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 const app = initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore(app);
 
+// 2. Configure S3 Client for TRULY Anonymous Access
+// By omitting credentials and setting the signer to a no-op, 
+// we bypass the "InvalidAccessKeyId" error and the "403 Forbidden".
+const s3Client = new S3Client({
+    region: "us-east-1",
+    signer: { sign: async (request) => request } 
+});
+
 async function executeTacticalSweep() {
     try {
-        console.log("--- INITIATING 2026 STEALTH INTERCEPT ---");
-        
+        console.log("--- INITIATING 2026 SDK INTERCEPT ---");
         const now = new Date();
         const year = now.getUTCFullYear();
         const month = String(now.getUTCMonth() + 1).padStart(2, '0');
         const day = String(now.getUTCDate()).padStart(2, '0');
-        
-        // NOAA Folders are UTC-based
         const prefix = `${year}/${month}/${day}/KLSX/`;
+
         console.log(`[SYSTEM] Accessing NOAA Sector: ${prefix} (UTC)`);
 
-        // 1. Fetch the bucket directory with a Stealth User-Agent
-        // Using the standard S3 XML endpoint
-        const listUrl = `https://noaa-nexrad-level2.s3.amazonaws.com/?prefix=${prefix}`;
-        
-        const response = await fetch(listUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
+        // 3. Use the SDK to list objects anonymously
+        const listCommand = new ListObjectsV2Command({
+            Bucket: "noaa-nexrad-level2",
+            Prefix: prefix
         });
 
-        if (!response.ok) {
-            console.error(`[ERROR] Tactical Rejection: ${response.status} ${response.statusText}`);
-            // If we get a 403, we need to log the headers to see what S3 is demanding
+        const listOutput = await s3Client.send(listCommand);
+        
+        if (!listOutput.Contents || listOutput.Contents.length === 0) {
+            console.log("[ALERT] Sector empty. No 2026 data found in this window.");
             return;
         }
 
-        const xmlText = await response.text();
-        
-        // 2. Extract and filter for the freshest V06 binaries
-        const keys = [...xmlText.matchAll(/<Key>(.*?)<\/Key>/g)].map(m => m[1]);
-        const validScans = keys.filter(k => k.endsWith('V06') && !k.endsWith('_MDM'));
-
-        console.log(`[SYSTEM] Discovery: Found ${keys.length} total objects, ${validScans.length} valid radar binaries.`);
+        // Filter for valid radar binaries (V06) and sort for the latest
+        const validScans = listOutput.Contents
+            .filter(item => item.Key.endsWith('V06') && !item.Key.endsWith('_MDM'))
+            .sort((a, b) => b.LastModified - a.LastModified);
 
         if (validScans.length === 0) {
-            console.log("[ALERT] Sector empty. Checking NOAA status...");
+            console.log("[ALERT] No valid binaries found in this sector.");
             return;
         }
 
-        // Sort to get the absolute newest file
-        validScans.sort();
-        const targetScanKey = validScans[validScans.length - 1];
+        const targetScanKey = validScans[0].Key;
         console.log(`[SUCCESS] Intercepted latest 2026 transmission: ${targetScanKey}`);
 
-        // 3. Download the binary payload directly into memory
-        const downloadUrl = `https://noaa-nexrad-level2.s3.amazonaws.com/${targetScanKey}`;
-        const fileResponse = await fetch(downloadUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
+        // 4. Download directly to RAM using the SDK
+        const getCommand = new GetObjectCommand({
+            Bucket: "noaa-nexrad-level2",
+            Key: targetScanKey
         });
-        const rawBuffer = Buffer.from(await fileResponse.arrayBuffer());
 
-        console.log(`[SYSTEM] Memory Load: ${(rawBuffer.length / 1024 / 1024).toFixed(2)} MB locked in RAM.`);
+        const response = await s3Client.send(getCommand);
+        const rawBuffer = Buffer.from(await response.Body.transformToByteArray());
 
-        // 4. Parse the raw memory buffer
+        console.log(`[SYSTEM] Memory Load: ${(rawBuffer.length / (1024 * 1024)).toFixed(2)} MB locked in RAM.`);
+
+        // 5. Parse using the local nexrad dependency
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
         let stormPoints = [];
@@ -74,8 +75,8 @@ async function executeTacticalSweep() {
                 const record = radialMsg.record;
                 if (record.reflect && record.reflect.moment_data) {
                     record.reflect.moment_data.forEach((dbz, gateIndex) => {
-                        // Threshold of 15-20 dBZ to capture atmospheric data without ground clutter
-                        if (dbz !== null && dbz >= 18) { 
+                        // Extracting significant atmospheric points
+                        if (dbz !== null && dbz >= 18) {
                             stormPoints.push({ a: record.azimuth, g: gateIndex, v: Math.round(dbz) });
                         }
                     });
@@ -84,16 +85,14 @@ async function executeTacticalSweep() {
         });
 
         if (stormPoints.length > 0) {
-            // Take top 1000 heaviest points
             const tacticalPayload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
-
-            // Time stamping for the HUD timeline (Local Time)
+            
+            // Sync with your 5-minute database requirement
             const localNow = new Date();
             const mins = Math.floor(localNow.getMinutes() / 5) * 5;
-            const archiveTime = String(localNow.getHours()).padStart(2, '0') + String(mins).padStart(2, '0');
-            const documentName = `STORM_${localNow.getFullYear()}-${String(localNow.getMonth() + 1).padStart(2, '0')}-${String(localNow.getDate()).padStart(2, '0')}_${archiveTime}`;
+            const docName = `STORM_${year}-${month}-${day}_${String(localNow.getHours()).padStart(2, '0')}${String(mins).padStart(2, '0')}`;
 
-            await db.collection("radar_archive").doc(documentName).set({
+            await db.collection("radar_archive").doc(docName).set({
                 points: JSON.stringify(tacticalPayload),
                 count: tacticalPayload.length,
                 timestamp: Date.now(),
@@ -101,11 +100,10 @@ async function executeTacticalSweep() {
                 source: targetScanKey
             });
 
-            console.log(`[SUCCESS] Data locked in Cabinet -> ${documentName}`);
+            console.log(`[SUCCESS] Data locked in Cabinet -> ${docName}`);
         }
     } catch (error) {
         console.error("MISSION CRITICAL FAILURE:", error);
-        process.exit(1);
     }
 }
 
