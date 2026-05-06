@@ -1,6 +1,5 @@
 import { initializeApp, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
-import { S3Client, ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";
 import { Level2Radar } from 'nexrad-level-2-data';
 
 // --- CABINET AUTHENTICATION ---
@@ -8,62 +7,52 @@ const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 const app = initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore(app);
 
-// --- TACTICAL S3 CONFIGURATION ---
-// We provide dummy credentials to prevent the 'CredentialsProviderError'
-// while the 'signer' middleware ensures we stay anonymous.
-const s3Client = new S3Client({
-    region: "us-east-1",
-    credentials: {
-        accessKeyId: "00000000000000000000", 
-        secretAccessKey: "0000000000000000000000000000000000000000"
-    },
-    signer: { sign: async (request) => request } 
-});
-
 async function executeTacticalSweep() {
     try {
-        console.log("--- INITIATING 2026 SDK INTERCEPT ---");
+        console.log("--- INITIATING 2026 STEALTH INTERCEPT ---");
+        
         const now = new Date();
         const year = now.getUTCFullYear();
         const month = String(now.getUTCMonth() + 1).padStart(2, '0');
         const day = String(now.getUTCDate()).padStart(2, '0');
         const prefix = `${year}/${month}/${day}/KLSX/`;
 
-        console.log(`[SYSTEM] Accessing NOAA Sector: ${prefix} (UTC)`);
+        // Using the direct public URL to bypass the AWS SDK's restrictive handshake
+        const listUrl = `https://noaa-nexrad-level2.s3.amazonaws.com/?list-type=2&prefix=${prefix}`;
+        
+        console.log(`[SYSTEM] Pulling Sector: ${prefix}`);
 
-        const listCommand = new ListObjectsV2Command({
-            Bucket: "noaa-nexrad-level2",
-            Prefix: prefix
+        const response = await fetch(listUrl, {
+            method: 'GET',
+            headers: {
+                // This makes the GitHub server look like a standard Windows browser
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'Accept': 'application/xml'
+            }
         });
 
-        const listOutput = await s3Client.send(listCommand);
-        
-        if (!listOutput.Contents || listOutput.Contents.length === 0) {
-            console.log("[ALERT] Sector empty. No 2026 data found in this window.");
-            return;
+        if (!response.ok) {
+            throw new Error(`NOAA Rejection: ${response.status} ${response.statusText}`);
         }
 
-        const validScans = listOutput.Contents
-            .filter(item => item.Key.endsWith('V06') && !item.Key.endsWith('_MDM'))
-            .sort((a, b) => b.LastModified - a.LastModified);
+        const xmlText = await response.text();
+        const keys = [...xmlText.matchAll(/<Key>(.*?)<\/Key>/g)].map(m => m[1]);
+        const validScans = keys.filter(k => k.endsWith('V06') && !k.endsWith('_MDM'));
 
         if (validScans.length === 0) {
-            console.log("[ALERT] No valid binaries found in this sector.");
+            console.log("[ALERT] Sector currently empty on NOAA servers.");
             return;
         }
 
-        const targetScanKey = validScans[0].Key;
-        console.log(`[SUCCESS] Intercepted latest 2026 transmission: ${targetScanKey}`);
+        validScans.sort();
+        const targetScanKey = validScans[validScans.length - 1];
+        console.log(`[SUCCESS] Intercepted 2026 transmission: ${targetScanKey}`);
 
-        const getCommand = new GetObjectCommand({
-            Bucket: "noaa-nexrad-level2",
-            Key: targetScanKey
+        // Download directly to RAM
+        const fileResponse = await fetch(`https://noaa-nexrad-level2.s3.amazonaws.com/${targetScanKey}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
         });
-
-        const response = await s3Client.send(getCommand);
-        const rawBuffer = Buffer.from(await response.Body.transformToByteArray());
-
-        console.log(`[SYSTEM] Memory Load: ${(rawBuffer.length / (1024 * 1024)).toFixed(2)} MB locked in RAM.`);
+        const rawBuffer = Buffer.from(await fileResponse.arrayBuffer());
 
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
@@ -75,7 +64,7 @@ async function executeTacticalSweep() {
                 const record = radialMsg.record;
                 if (record.reflect && record.reflect.moment_data) {
                     record.reflect.moment_data.forEach((dbz, gateIndex) => {
-                        if (dbz !== null && dbz >= 18) {
+                        if (dbz !== null && dbz >= 18) { 
                             stormPoints.push({ a: record.azimuth, g: gateIndex, v: Math.round(dbz) });
                         }
                     });
@@ -85,22 +74,21 @@ async function executeTacticalSweep() {
 
         if (stormPoints.length > 0) {
             const tacticalPayload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
-            const localNow = new Date();
-            const mins = Math.floor(localNow.getMinutes() / 5) * 5;
-            const docName = `STORM_${year}-${month}-${day}_${String(localNow.getHours()).padStart(2, '0')}${String(mins).padStart(2, '0')}`;
+            const mins = Math.floor(now.getMinutes() / 5) * 5;
+            const docName = `STORM_${year}-${month}-${day}_${String(now.getHours()).padStart(2, '0')}${String(mins).padStart(2, '0')}`;
 
             await db.collection("radar_archive").doc(docName).set({
                 points: JSON.stringify(tacticalPayload),
-                count: tacticalPayload.length,
                 timestamp: Date.now(),
                 sensor: "KLSX",
                 source: targetScanKey
             });
 
-            console.log(`[SUCCESS] Data locked in Cabinet -> ${docName}`);
+            console.log(`[LOCKED] 2026 Data Uploaded: ${docName}`);
         }
     } catch (error) {
-        console.error("MISSION CRITICAL FAILURE:", error);
+        console.error("MISSION CRITICAL FAILURE:", error.message);
+        process.exit(1);
     }
 }
 
