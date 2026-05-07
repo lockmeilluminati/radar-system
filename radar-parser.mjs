@@ -9,9 +9,9 @@ const db = getFirestore();
 
 async function executeTacticalSweep() {
     try {
-        console.log("--- INITIATING 2026 BLIND GRAB INTERCEPT ---");
+        console.log("--- INITIATING DYNAMIC BLIND GRAB INTERCEPT ---");
         
-        // Back to the proven root directory (No date folders to 404 on)
+        // Target the proven root directory
         const iemBaseUrl = "https://mesonet-nexrad.agron.iastate.edu/level2/raw/KLSX/";
         console.log(`[SYSTEM] Accessing Open Directory: ${iemBaseUrl}`);
 
@@ -21,11 +21,10 @@ async function executeTacticalSweep() {
         const html = await response.text();
         
         // 1. The Blind Grab Regex
-        // Grabs every href link in the Apache directory listing
         const filePattern = /href="([^"]+)"/g;
         const matches = [...html.matchAll(filePattern)].map(m => m[1]);
         
-        // 2. Filter out the Apache sorting buttons and parent directories
+        // 2. Filter valid radar files
         const validFiles = matches.filter(name => 
             name.includes('KLSX') && 
             !name.includes('?C=') && 
@@ -33,8 +32,7 @@ async function executeTacticalSweep() {
         );
 
         if (validFiles.length === 0) {
-            console.log("[ALERT] Sector completely empty. Printing raw HTML for diagnostic:");
-            console.log(html.substring(0, 500)); 
+            console.log("[ALERT] Sector completely empty.");
             return;
         }
 
@@ -47,13 +45,13 @@ async function executeTacticalSweep() {
         const fileResponse = await fetch(downloadUrl);
         let rawBuffer = Buffer.from(await fileResponse.arrayBuffer());
 
-        // Tactical Decompression if the server happens to zip it
+        // Tactical Decompression
         if (targetFile.endsWith('.gz')) {
             rawBuffer = zlib.gunzipSync(rawBuffer);
             console.log(`[SYSTEM] Decompressed .gz binary in RAM.`);
         }
 
-        // 4. Parse and process
+        // 4. Parse and process coordinates
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
         let stormPoints = [];
@@ -63,7 +61,6 @@ async function executeTacticalSweep() {
                 const dbzData = msg.record?.reflect?.moment_data;
                 if (dbzData) {
                     dbzData.forEach((dbz, i) => {
-                        // Capturing intensity thresholds
                         if (dbz >= 18) {
                             stormPoints.push({ 
                                 a: msg.record.azimuth, 
@@ -79,9 +76,21 @@ async function executeTacticalSweep() {
         if (stormPoints.length > 0) {
             const payload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
             
-            const now = new Date();
-            const mins = Math.floor(now.getMinutes() / 5) * 5;
-            const docName = `STORM_2026-05-06_${String(now.getHours()).padStart(2, '0')}${String(mins).padStart(2, '0')}`;
+            // 5. DYNAMIC TIMESTAMP EXTRACTION
+            // Target File Format: KLSX_20260507_1307.gz
+            const cleanName = targetFile.replace('.gz', '');
+            const parts = cleanName.split('_');
+            
+            const dateStr = parts[1]; // e.g., "20260507"
+            const timeStr = parts[2]; // e.g., "1307"
+            
+            const yyyy = dateStr.substring(0, 4);
+            const mm = dateStr.substring(4, 6);
+            const dd = dateStr.substring(6, 8);
+            const hh = timeStr.substring(0, 2);
+            
+            // Format: STORM_2026-05-07_1300
+            const docName = `STORM_${yyyy}-${mm}-${dd}_${hh}00`;
 
             await db.collection("radar_archive").doc(docName).set({
                 points: JSON.stringify(payload),
@@ -90,7 +99,7 @@ async function executeTacticalSweep() {
                 source: `IEM_NEXRAD://${targetFile}`
             });
 
-            console.log(`[LOCKED] 2026 Data Deployed to Cabinet: ${docName}`);
+            console.log(`[LOCKED] Dynamic Data Deployed to Cabinet: ${docName}`);
         }
     } catch (error) {
         console.error("MISSION CRITICAL FAILURE:", error.message);
