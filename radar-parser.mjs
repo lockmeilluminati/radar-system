@@ -2,6 +2,8 @@ import { initializeApp, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import { Level2Radar } from 'nexrad-level-2-data';
 import zlib from 'zlib';
+import fs from 'fs';
+import path from 'path';
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 initializeApp({ credential: cert(serviceAccount) });
@@ -9,51 +11,52 @@ const db = getFirestore();
 
 async function executeTacticalSweep() {
     try {
-        console.log("--- INITIATING DYNAMIC BLIND GRAB INTERCEPT ---");
+        console.log("--- INITIATING 2026 DIAGNOSTIC INTERCEPT ---");
         
-        // Target the proven root directory
         const iemBaseUrl = "https://mesonet-nexrad.agron.iastate.edu/level2/raw/KLSX/";
-        console.log(`[SYSTEM] Accessing Open Directory: ${iemBaseUrl}`);
-
         const response = await fetch(iemBaseUrl);
         if (!response.ok) throw new Error(`Mirror Unavailable: ${response.status}`);
         
         const html = await response.text();
-        
-        // 1. The Blind Grab Regex
         const filePattern = /href="([^"]+)"/g;
         const matches = [...html.matchAll(filePattern)].map(m => m[1]);
         
-        // 2. Filter valid radar files
         const validFiles = matches.filter(name => 
-            name.includes('KLSX') && 
-            !name.includes('?C=') && 
-            !name.includes('/')
+            name.includes('KLSX') && !name.includes('?C=') && !name.includes('/')
         );
 
         if (validFiles.length === 0) {
-            console.log("[ALERT] Sector completely empty.");
+            console.log("[ALERT] Sector empty.");
             return;
         }
 
-        // Grab the absolute last file in the sorted list (the newest transmission)
         const targetFile = validFiles.sort().pop(); 
-        console.log(`[SUCCESS] Intercepted Raw Transmission: ${targetFile}`);
+        console.log(`[TARGET] Found Newest Transmission: ${targetFile}`);
 
-        // 3. THE RAM UPLINK
+        // --- STEP 1: PHYSICAL DOWNLOAD & DISK VERIFICATION ---
         const downloadUrl = `${iemBaseUrl}${targetFile}`;
         const fileResponse = await fetch(downloadUrl);
-        let rawBuffer = Buffer.from(await fileResponse.arrayBuffer());
+        const arrayBuffer = await fileResponse.arrayBuffer();
+        let rawBuffer = Buffer.from(arrayBuffer);
 
-        // Tactical Decompression
+        // Save to VM disk to prove it is not a hallucination
+        const localPath = path.join('/tmp', targetFile);
+        fs.writeFileSync(localPath, rawBuffer);
+        const stats = fs.statSync(localPath);
+        console.log(`[SUCCESS] File Downloaded: ${localPath} (${stats.size} bytes)`);
+
+        // --- STEP 2: DECOMPRESSION ---
         if (targetFile.endsWith('.gz')) {
             rawBuffer = zlib.gunzipSync(rawBuffer);
-            console.log(`[SYSTEM] Decompressed .gz binary in RAM.`);
+            console.log(`[SYSTEM] Decompressed .gz binary (Size in RAM: ${rawBuffer.length} bytes)`);
         }
 
-        // 4. Parse and process coordinates
+        // --- STEP 3: FULL EXTRACTION TELEMETRY ---
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
+        console.log(`[DECODER] Binary Scanned: ${sweeps.length} Sweeps detected.`);
+
+        let totalRawPoints = 0;
         let stormPoints = [];
 
         sweeps.forEach((sweep) => {
@@ -61,6 +64,8 @@ async function executeTacticalSweep() {
                 const dbzData = msg.record?.reflect?.moment_data;
                 if (dbzData) {
                     dbzData.forEach((dbz, i) => {
+                        totalRawPoints++;
+                        // Capture azimuth and dBZ intensity
                         if (dbz >= 18) {
                             stormPoints.push({ 
                                 a: msg.record.azimuth, 
@@ -73,24 +78,34 @@ async function executeTacticalSweep() {
             });
         });
 
+        console.log(`[TELEMETRY] Total Points Processed: ${totalRawPoints}`);
+        console.log(`[TELEMETRY] Storm Points Extracted (>= 18 dBZ): ${stormPoints.length}`);
+
         if (stormPoints.length > 0) {
+            // Optimization for the HUD: Take top 1000 intensities
             const payload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
             
-            // 5. DYNAMIC TIMESTAMP EXTRACTION
-            // Target File Format: KLSX_20260507_1307.gz
-            const cleanName = targetFile.replace('.gz', '');
-            const parts = cleanName.split('_');
+            // --- STEP 4: ST. LOUIS TIME-LOCK ---
+            const parts = targetFile.replace('.gz', '').split('_');
+            const radarDate = new Date(Date.UTC(
+                parseInt(parts[1].substring(0, 4)),
+                parseInt(parts[1].substring(4, 6)) - 1,
+                parseInt(parts[1].substring(6, 8)),
+                parseInt(parts[2].substring(0, 2)),
+                parseInt(parts[2].substring(2, 4))
+            ));
             
-            const dateStr = parts[1]; // e.g., "20260507"
-            const timeStr = parts[2]; // e.g., "1307"
+            const formatter = new Intl.DateTimeFormat('en-US', {
+                timeZone: 'America/Chicago',
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', hour12: false
+            });
             
-            const yyyy = dateStr.substring(0, 4);
-            const mm = dateStr.substring(4, 6);
-            const dd = dateStr.substring(6, 8);
-            const hh = timeStr.substring(0, 2);
-            
-            // Format: STORM_2026-05-07_1300
-            const docName = `STORM_${yyyy}-${mm}-${dd}_${hh}00`;
+            const tz = formatter.formatToParts(radarDate).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+            const hh = tz.hour === '24' ? '00' : tz.hour;
+
+            const docName = `STORM_${tz.year}-${tz.month}-${tz.day}_${hh}00`;
+            console.log(`[UPLINK] Deploying to Cabinet: radar_archive/${docName}`);
 
             await db.collection("radar_archive").doc(docName).set({
                 points: JSON.stringify(payload),
@@ -99,7 +114,9 @@ async function executeTacticalSweep() {
                 source: `IEM_NEXRAD://${targetFile}`
             });
 
-            console.log(`[LOCKED] Dynamic Data Deployed to Cabinet: ${docName}`);
+            console.log(`[LOCKED] Deployment Confirmed. Document is LIVE.`);
+        } else {
+            console.log("[ALERT] Extraction complete but 0 significant storm points found.");
         }
     } catch (error) {
         console.error("MISSION CRITICAL FAILURE:", error.message);
