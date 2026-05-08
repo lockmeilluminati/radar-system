@@ -25,10 +25,7 @@ async function executeTacticalSweep() {
             name.includes('KLSX') && !name.includes('?C=') && !name.includes('/')
         );
 
-        if (validFiles.length === 0) {
-            console.log("[ALERT] Sector empty.");
-            return;
-        }
+        if (validFiles.length === 0) return;
 
         const targetFile = validFiles.sort().pop(); 
         console.log(`[TARGET] Found Newest Transmission: ${targetFile}`);
@@ -39,7 +36,6 @@ async function executeTacticalSweep() {
         const arrayBuffer = await fileResponse.arrayBuffer();
         let rawBuffer = Buffer.from(arrayBuffer);
 
-        // Save to VM disk to prove it is not a hallucination
         const localPath = path.join('/tmp', targetFile);
         fs.writeFileSync(localPath, rawBuffer);
         const stats = fs.statSync(localPath);
@@ -48,7 +44,7 @@ async function executeTacticalSweep() {
         // --- STEP 2: DECOMPRESSION ---
         if (targetFile.endsWith('.gz')) {
             rawBuffer = zlib.gunzipSync(rawBuffer);
-            console.log(`[SYSTEM] Decompressed .gz binary (Size in RAM: ${rawBuffer.length} bytes)`);
+            console.log(`[SYSTEM] Decompressed .gz binary in RAM.`);
         }
 
         // --- STEP 3: FULL EXTRACTION TELEMETRY ---
@@ -65,13 +61,8 @@ async function executeTacticalSweep() {
                 if (dbzData) {
                     dbzData.forEach((dbz, i) => {
                         totalRawPoints++;
-                        // Capture azimuth and dBZ intensity
                         if (dbz >= 18) {
-                            stormPoints.push({ 
-                                a: msg.record.azimuth, 
-                                g: i, 
-                                v: Math.round(dbz) 
-                            });
+                            stormPoints.push({ a: msg.record.azimuth, g: i, v: Math.round(dbz) });
                         }
                     });
                 }
@@ -82,10 +73,9 @@ async function executeTacticalSweep() {
         console.log(`[TELEMETRY] Storm Points Extracted (>= 18 dBZ): ${stormPoints.length}`);
 
         if (stormPoints.length > 0) {
-            // Optimization for the HUD: Take top 1000 intensities
             const payload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
             
-            // --- STEP 4: ST. LOUIS TIME-LOCK ---
+            // --- STEP 4: 5-MINUTE MICRO-LOCK (St. Louis Time) ---
             const parts = targetFile.replace('.gz', '').split('_');
             const radarDate = new Date(Date.UTC(
                 parseInt(parts[1].substring(0, 4)),
@@ -98,13 +88,19 @@ async function executeTacticalSweep() {
             const formatter = new Intl.DateTimeFormat('en-US', {
                 timeZone: 'America/Chicago',
                 year: 'numeric', month: '2-digit', day: '2-digit',
-                hour: '2-digit', hour12: false
+                hour: '2-digit', minute: '2-digit', hour12: false
             });
             
             const tz = formatter.formatToParts(radarDate).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+            
             const hh = tz.hour === '24' ? '00' : tz.hour;
+            
+            // Snap exact radar minute to the nearest 5-minute interval for the UI
+            const exactMin = parseInt(tz.minute);
+            const snappedMin = Math.floor(exactMin / 5) * 5;
+            const mm = String(snappedMin).padStart(2, '0');
 
-            const docName = `STORM_${tz.year}-${tz.month}-${tz.day}_${hh}00`;
+            const docName = `STORM_${tz.year}-${tz.month}-${tz.day}_${hh}${mm}`;
             console.log(`[UPLINK] Deploying to Cabinet: radar_archive/${docName}`);
 
             await db.collection("radar_archive").doc(docName).set({
