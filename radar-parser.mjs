@@ -47,7 +47,7 @@ async function executeTacticalSweep() {
             console.log(`[SYSTEM] Decompressed .gz binary in RAM.`);
         }
 
-        // --- STEP 3: FULL EXTRACTION TELEMETRY (CLOSED-LOOP) ---
+        // --- STEP 3: FULL EXTRACTION TELEMETRY ---
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
         console.log(`[DECODER] Binary Scanned: ${sweeps.length} Sweeps detected.`);
@@ -57,27 +57,12 @@ async function executeTacticalSweep() {
 
         sweeps.forEach((sweep) => {
             sweep?.forEach((msg) => {
-                const az = msg.record.azimuth;
                 const dbzData = msg.record?.reflect?.moment_data;
-                const velData = msg.record?.velocity?.moment_data;
-
-                // Process Reflectivity (v) -> Used for Radar, Storms, and Hail
                 if (dbzData) {
                     dbzData.forEach((dbz, i) => {
                         totalRawPoints++;
                         if (dbz >= 18) {
-                            stormPoints.push({ a: az, g: i, v: Math.round(dbz) });
-                        }
-                    });
-                }
-
-                // Process Doppler Velocity (w) -> Used for Wind Engine
-                if (velData) {
-                    velData.forEach((vel, i) => {
-                        totalRawPoints++;
-                        // Filter out stagnant air (near 0 m/s) to save payload space
-                        if (Math.abs(vel) >= 5) { 
-                            stormPoints.push({ a: az, g: i, w: Math.round(vel) });
+                            stormPoints.push({ a: msg.record.azimuth, g: i, v: Math.round(dbz) });
                         }
                     });
                 }
@@ -85,13 +70,10 @@ async function executeTacticalSweep() {
         });
 
         console.log(`[TELEMETRY] Total Points Processed: ${totalRawPoints}`);
-        console.log(`[TELEMETRY] Usable Tactical Points Extracted: ${stormPoints.length}`);
+        console.log(`[TELEMETRY] Storm Points Extracted (>= 18 dBZ): ${stormPoints.length}`);
 
         if (stormPoints.length > 0) {
-            // Sort by absolute intensity (dBZ or Wind Speed) and bump slice to 1500 for the dual-data
-            const payload = stormPoints
-                .sort((a, b) => (b.v || Math.abs(b.w)) - (a.v || Math.abs(a.w)))
-                .slice(0, 1500);
+            const payload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
             
             // --- STEP 4: 5-MINUTE MICRO-LOCK (St. Louis Time) ---
             const parts = targetFile.replace('.gz', '').split('_');
@@ -113,6 +95,7 @@ async function executeTacticalSweep() {
             
             const hh = tz.hour === '24' ? '00' : tz.hour;
             
+            // Snap exact radar minute to the nearest 5-minute interval for the UI
             const exactMin = parseInt(tz.minute);
             const snappedMin = Math.floor(exactMin / 5) * 5;
             const mm = String(snappedMin).padStart(2, '0');
@@ -131,13 +114,6 @@ async function executeTacticalSweep() {
         } else {
             console.log("[ALERT] Extraction complete but 0 significant storm points found.");
         }
-
-        // --- STEP 5: TACTICAL CLEANUP ---
-        if (fs.existsSync(localPath)) {
-            fs.unlinkSync(localPath);
-            console.log(`[SYSTEM] Cleared temporary asset from memory: ${localPath}`);
-        }
-
     } catch (error) {
         console.error("MISSION CRITICAL FAILURE:", error.message);
     }
