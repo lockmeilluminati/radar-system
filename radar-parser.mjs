@@ -5,16 +5,15 @@ import zlib from 'zlib';
 import fs from 'fs';
 import path from 'path';
 
-// Authenticate with Firebase using the GitHub Secret
+// Authenticate with Firebase
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
 
 async function executeTacticalSweep() {
     try {
-        console.log("--- INITIATING 2026 DIAGNOSTIC INTERCEPT (10-MIN CYCLE) ---");
+        console.log("--- INITIATING SMARTER BOUNCER (10-MIN CYCLE) ---");
         
-        // Target: St. Louis (KLSX) 
         const iemBaseUrl = "https://mesonet-nexrad.agron.iastate.edu/level2/raw/KLSX/";
         const response = await fetch(iemBaseUrl);
         if (!response.ok) throw new Error(`Mirror Unavailable: ${response.status}`);
@@ -23,67 +22,62 @@ async function executeTacticalSweep() {
         const filePattern = /href="([^"]+)"/g;
         const matches = [...html.matchAll(filePattern)].map(m => m[1]);
         
-        // Filter for valid binary files
         const validFiles = matches.filter(name => 
             name.includes('KLSX') && !name.includes('?C=') && !name.includes('/')
         );
 
-        if (validFiles.length === 0) {
-            console.log("[ALERT] No valid telemetry files found on the mirror.");
-            return;
-        }
+        if (validFiles.length === 0) return;
 
         const targetFile = validFiles.sort().pop(); 
         console.log(`[TARGET] Found Newest Transmission: ${targetFile}`);
 
-        // --- STEP 1: PHYSICAL DOWNLOAD & DISK VERIFICATION ---
+        // Download Binary
         const downloadUrl = `${iemBaseUrl}${targetFile}`;
         const fileResponse = await fetch(downloadUrl);
         const arrayBuffer = await fileResponse.arrayBuffer();
         let rawBuffer = Buffer.from(arrayBuffer);
 
-        const localPath = path.join('/tmp', targetFile);
-        fs.writeFileSync(localPath, rawBuffer);
-        const stats = fs.statSync(localPath);
-        console.log(`[SUCCESS] File Downloaded: ${localPath} (${stats.size} bytes)`);
-
-        // --- STEP 2: DECOMPRESSION ---
+        // Decompress
         if (targetFile.endsWith('.gz')) {
             rawBuffer = zlib.gunzipSync(rawBuffer);
-            console.log(`[SYSTEM] Decompressed .gz binary in RAM.`);
         }
 
-        // --- STEP 3: FULL EXTRACTION TELEMETRY ---
+        // Decode Level 2 Telemetry
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
-        console.log(`[DECODER] Binary Scanned: ${sweeps.length} Sweeps detected.`);
-
-        let totalRawPoints = 0;
+        
         let stormPoints = [];
 
-        // Parse azimuth and DBZ for intense storm activity
         sweeps.forEach((sweep) => {
             sweep?.forEach((msg) => {
                 const dbzData = msg.record?.reflect?.moment_data;
                 if (dbzData) {
                     dbzData.forEach((dbz, i) => {
-                        totalRawPoints++;
-                        if (dbz >= 18) {
-                            stormPoints.push({ a: msg.record.azimuth, g: i, v: Math.round(dbz) });
+                        let type = "";
+                        // SMARTER BOUNCER THRESHOLDS
+                        if (dbz >= 50) { type = "HAIL"; }
+                        else if (dbz >= 35) { type = "HEAVY_RAIN"; }
+                        else if (dbz >= 20) { type = "LIGHT_RAIN"; }
+                        else if (dbz >= 5) { type = "CLOUDS"; }
+
+                        if (type !== "") {
+                            stormPoints.push({ 
+                                a: msg.record.azimuth, 
+                                g: i, 
+                                v: Math.round(dbz),
+                                t: type 
+                            });
                         }
                     });
                 }
             });
         });
 
-        console.log(`[TELEMETRY] Total Points Processed: ${totalRawPoints}`);
-        console.log(`[TELEMETRY] Storm Points Extracted (>= 18 dBZ): ${stormPoints.length}`);
-
         if (stormPoints.length > 0) {
-            // Take the top 1000 highest intensity points to keep the payload fast
+            // PRIORITY SORT: Dangerous weather gets to the front of the line
             const payload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
             
-            // --- STEP 4: 10-MINUTE MICRO-LOCK (St. Louis Time / Central) ---
+            // Snap to 10-minute floor (St. Louis Time)
             const parts = targetFile.replace('.gz', '').split('_');
             const radarDate = new Date(Date.UTC(
                 parseInt(parts[1].substring(0, 4)),
@@ -100,27 +94,20 @@ async function executeTacticalSweep() {
             });
             
             const tz = formatter.formatToParts(radarDate).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
-            
             const hh = tz.hour === '24' ? '00' : tz.hour;
-            
-            // Snap exact radar minute to the nearest 10-minute interval for the UI
-            const exactMin = parseInt(tz.minute);
-            const snappedMin = Math.floor(exactMin / 10) * 10;
+            const snappedMin = Math.floor(parseInt(tz.minute) / 10) * 10;
             const mm = String(snappedMin).padStart(2, '0');
 
             const docName = `STORM_${tz.year}-${tz.month}-${tz.day}_${hh}${mm}`;
-            console.log(`[UPLINK] Deploying to Cabinet: radar_archive/${docName}`);
+            console.log(`[UPLINK] Deploying ${payload.length} points to: radar_archive/${docName}`);
 
             await db.collection("radar_archive").doc(docName).set({
                 points: JSON.stringify(payload),
                 timestamp: Date.now(),
-                sensor: "KLSX",
-                source: `IEM_NEXRAD://${targetFile}`
+                sensor: "KLSX"
             });
 
-            console.log(`[LOCKED] Deployment Confirmed. Document is LIVE.`);
-        } else {
-            console.log("[ALERT] Extraction complete but 0 significant storm points found.");
+            console.log(`[LOCKED] Document is LIVE.`);
         }
     } catch (error) {
         console.error("MISSION CRITICAL FAILURE:", error.message);
