@@ -3,7 +3,7 @@ import { getFirestore } from "firebase-admin/firestore";
 import { Level2Radar } from 'nexrad-level-2-data';
 import zlib from 'zlib';
 
-// Initialize Firebase
+// Initialize Firebase (Ensure your FIREBASE_KEY env variable is set)
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
@@ -18,6 +18,7 @@ async function executeTacticalSweep() {
         
         const html = await response.text();
         const matches = [...html.matchAll(/href="([^"]+)"/g)].map(m => m[1]);
+        // Find the most recent Level 2 volume scan
         const targetFile = matches.filter(n => n.includes('KLSX') && !n.includes('?')).sort().pop();
 
         if (!targetFile) {
@@ -38,7 +39,8 @@ async function executeTacticalSweep() {
             console.log(`[SYSTEM] Binary expanded in RAM.`);
         }
 
-        // STEP 3: Parse and Classify
+        // STEP 3: Parse and Classify with Hard Math
+        // Decoding the real Level 2 Base Reflectivity moments
         const radar = await new Level2Radar(rawBuffer);
         const sweeps = radar.data || [];
         let stormPoints = [];
@@ -48,15 +50,11 @@ async function executeTacticalSweep() {
                 const dbzData = msg.record?.reflect?.moment_data;
                 if (dbzData) {
                     dbzData.forEach((dbz, i) => {
-                        let type = "";
-                        // Classification Tiers
-                        if (dbz >= 50) type = "HAIL";
-                        else if (dbz >= 35) type = "HEAVY_RAIN";
-                        else if (dbz >= 20) type = "LIGHT_RAIN";
-                        else if (dbz >= 5) type = "CLOUDS";
-
-                        if (type !== "") {
-                            stormPoints.push({ a: msg.record.azimuth, g: i, v: Math.round(dbz), t: type });
+                        // Hard Calculation: Enforce 18 dBZ minimum threshold
+                        // Filters out clear air mode, anomalous propagation, and light clouds
+                        if (dbz >= 18) {
+                            // a = azimuth angle, g = gate index (250m spacing), v = dBZ value
+                            stormPoints.push({ a: msg.record.azimuth, g: i, v: Math.round(dbz) });
                         }
                     });
                 }
@@ -64,10 +62,11 @@ async function executeTacticalSweep() {
         });
 
         if (stormPoints.length > 0) {
-            // Sort by intensity so dangerous weather fills the 1000-point payload first
+            // Sort by intensity (highest dBZ first) to prioritize severe weather
+            // Slice top 1000 to keep the Section 9 payload optimized for the HUD
             const payload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
             
-            // Step 4: Logic for 10-minute floor snapping
+            // STEP 4: Temporal Alignment (10-Minute Floor Snapping)
             const parts = targetFile.replace('.gz', '').split('_');
             const radarDate = new Date(Date.UTC(
                 parseInt(parts[1].substring(0, 4)),
@@ -98,7 +97,9 @@ async function executeTacticalSweep() {
                 source: `IEM_NEXRAD://${targetFile}`
             });
 
-            console.log(`[LOCKED] Deployment Confirmed via RAM.`);
+            console.log(`[LOCKED] Deployment Confirmed via RAM. Processed ${payload.length} high-intensity points.`);
+        } else {
+            console.log(`[SYSTEM] No data above 18 dBZ detected in volume scan.`);
         }
     } catch (error) {
         console.error("MISSION CRITICAL FAILURE:", error.message);
