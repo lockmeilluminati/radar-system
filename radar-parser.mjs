@@ -5,14 +5,16 @@ import zlib from 'zlib';
 import fs from 'fs';
 import path from 'path';
 
+// Authenticate with Firebase using the GitHub Secret
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
 
 async function executeTacticalSweep() {
     try {
-        console.log("--- INITIATING 2026 DIAGNOSTIC INTERCEPT ---");
+        console.log("--- INITIATING 2026 DIAGNOSTIC INTERCEPT (10-MIN CYCLE) ---");
         
+        // Target: St. Louis (KLSX) 
         const iemBaseUrl = "https://mesonet-nexrad.agron.iastate.edu/level2/raw/KLSX/";
         const response = await fetch(iemBaseUrl);
         if (!response.ok) throw new Error(`Mirror Unavailable: ${response.status}`);
@@ -21,11 +23,15 @@ async function executeTacticalSweep() {
         const filePattern = /href="([^"]+)"/g;
         const matches = [...html.matchAll(filePattern)].map(m => m[1]);
         
+        // Filter for valid binary files
         const validFiles = matches.filter(name => 
             name.includes('KLSX') && !name.includes('?C=') && !name.includes('/')
         );
 
-        if (validFiles.length === 0) return;
+        if (validFiles.length === 0) {
+            console.log("[ALERT] No valid telemetry files found on the mirror.");
+            return;
+        }
 
         const targetFile = validFiles.sort().pop(); 
         console.log(`[TARGET] Found Newest Transmission: ${targetFile}`);
@@ -55,6 +61,7 @@ async function executeTacticalSweep() {
         let totalRawPoints = 0;
         let stormPoints = [];
 
+        // Parse azimuth and DBZ for intense storm activity
         sweeps.forEach((sweep) => {
             sweep?.forEach((msg) => {
                 const dbzData = msg.record?.reflect?.moment_data;
@@ -73,9 +80,10 @@ async function executeTacticalSweep() {
         console.log(`[TELEMETRY] Storm Points Extracted (>= 18 dBZ): ${stormPoints.length}`);
 
         if (stormPoints.length > 0) {
+            // Take the top 1000 highest intensity points to keep the payload fast
             const payload = stormPoints.sort((a, b) => b.v - a.v).slice(0, 1000);
             
-            // --- STEP 4: 5-MINUTE MICRO-LOCK (St. Louis Time) ---
+            // --- STEP 4: 10-MINUTE MICRO-LOCK (St. Louis Time / Central) ---
             const parts = targetFile.replace('.gz', '').split('_');
             const radarDate = new Date(Date.UTC(
                 parseInt(parts[1].substring(0, 4)),
@@ -95,9 +103,9 @@ async function executeTacticalSweep() {
             
             const hh = tz.hour === '24' ? '00' : tz.hour;
             
-            // Snap exact radar minute to the nearest 5-minute interval for the UI
+            // Snap exact radar minute to the nearest 10-minute interval for the UI
             const exactMin = parseInt(tz.minute);
-            const snappedMin = Math.floor(exactMin / 5) * 5;
+            const snappedMin = Math.floor(exactMin / 10) * 10;
             const mm = String(snappedMin).padStart(2, '0');
 
             const docName = `STORM_${tz.year}-${tz.month}-${tz.day}_${hh}${mm}`;
